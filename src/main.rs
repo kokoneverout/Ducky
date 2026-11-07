@@ -12,6 +12,7 @@ mod platform;
 mod startup;
 mod ui;
 
+use futures_lite::StreamExt;
 use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 use std::sync::{Arc, RwLock};
 
@@ -93,11 +94,23 @@ fn run() -> anyhow::Result<()> {
                 *palette.token_mut(name) = gpui::rgb(color).into();
             }
             ely_core::theme::Theme::set_palette(ely_core::theme::Mode::Light, Some(palette), cx);
-            if !isolated {
-                if let Err(error) = swiftclip::launch(cx, true) {
-                    platform::show_error(&format!("剪贴板模块启动失败：{error:#}"));
+            let clipboard_service = if isolated {
+                None
+            } else {
+                match swiftclip::Service::start() {
+                    Ok(service) => {
+                        service.install_shutdown(cx);
+                        Some(service)
+                    }
+                    Err(error) => {
+                        platform::show_error(&format!("剪贴板模块启动失败：{error:#}"));
+                        None
+                    }
                 }
-            }
+            };
+            let clipboard = clipboard_service
+                .as_ref()
+                .map(|service| (service.backend.clone(), service.settings.clone()));
             let bounds = Bounds::centered(None, size(px(900.0), px(680.0)), cx);
             let ui_events = events.clone();
             let ui_config = config.clone();
@@ -108,7 +121,7 @@ fn run() -> anyhow::Result<()> {
                         title: Some(if isolated {
                             "Ducky · 界面预览".into()
                         } else {
-                            "Ducky · 语音输入".into()
+                            "Ducky".into()
                         }),
                         appears_transparent: false,
                         ..Default::default()
@@ -126,7 +139,7 @@ fn run() -> anyhow::Result<()> {
                     });
                     cx.new(|cx| {
                         ui::VoiceApp::new(
-                            ui_config, ui_events, history, startup, isolated, window, cx,
+                            ui_config, ui_events, history, startup, isolated, clipboard, window, cx,
                         )
                     })
                 },
@@ -141,6 +154,19 @@ fn run() -> anyhow::Result<()> {
                     return;
                 }
             };
+            if let Some(mut service) = clipboard_service {
+                cx.spawn(async move |cx| {
+                    while let Some(event) = service.receiver.next().await {
+                        if main
+                            .update(cx, |app, window, cx| app.clipboard_event(event, window, cx))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
             if smoke {
                 run_smoke(main, popup.probe(), events.clone(), cx);
             }

@@ -6,10 +6,9 @@ use ely_core::{
     },
     layout::ScrollArea,
     menus::{ContextMenu, Menu as ElyMenu, MenuItem as ElyMenuItem},
-    navigation::NavItem,
     overlays::Dialog,
-    primitives::{FocusScope, Icon, IconName},
-    theme::{ActiveTheme, ControlSize, Mode, Palette, Theme},
+    primitives::{FocusScope, IconName},
+    theme::{ActiveTheme, ControlSize},
     typography::SelectableText,
 };
 use gpui::{prelude::*, *};
@@ -22,33 +21,7 @@ pub fn hwnd(window: &Window) -> isize {
         _ => 0,
     }
 }
-const PAGE_BACKGROUND: u32 = 0xfaf5e6;
-const PAGE_FOREGROUND: u32 = 0x415451;
 const UI_FONT: &str = "MiSans";
-
-pub fn style_titlebar(window: &Window) {
-    platform::style_titlebar(hwnd(window), PAGE_BACKGROUND, PAGE_FOREGROUND);
-}
-pub fn setup_theme(cx: &mut App) {
-    let mut light = Palette::light(false);
-    light.bg = rgb(PAGE_BACKGROUND).into();
-    light.sunken = rgb(0xfcf7e8).into();
-    light.surface = rgb(0xfffcf5).into();
-    light.overlay = light.surface;
-    light.fg = rgb(PAGE_FOREGROUND).into();
-    light.fg_muted = rgb(0x6d786d).into();
-    light.fg_subtle = light.fg_muted;
-    light.border = rgb(0xe5e1d4).into();
-    light.accent = rgb(0x3f6256).into();
-    light.selection = rgb(0xe6e7da).into();
-    light.hover = light.selection;
-    Theme::set_palette(Mode::Light, Some(light), cx);
-    Theme::set_mode_now(Mode::Light, cx);
-    Theme::update(cx, |t| {
-        t.font_family = UI_FONT.into();
-        t.reduced_motion = true;
-    });
-}
 
 pub struct Shell {
     pub backend: Backend,
@@ -58,6 +31,7 @@ pub struct Shell {
     loaded_revision: u64,
     copy_inflight: bool,
     pub page: bool,
+    pub active: bool,
     pub hidden: bool,
     pub tray_ready: bool,
     pub quick_target: Option<PasteTarget>,
@@ -126,10 +100,13 @@ impl Shell {
                 }));
             }
         });
-        // GPUI updates the native caption mode when Windows appearance changes.
-        // Keep our fixed light caption in sync without exposing a theme setting.
-        let appearance = cx.observe_window_appearance(window, |_, window, _| {
-            style_titlebar(window);
+        let activation = cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() && this.hidden && this.active {
+                this.hidden = false;
+                this.revision += 1;
+                this.query(cx);
+                cx.notify();
+            }
         });
         let weak = cx.entity().downgrade();
         let window_id = hwnd(window);
@@ -157,8 +134,9 @@ impl Shell {
             loaded_revision: 0,
             copy_inflight: false,
             page: false,
+            active: false,
             hidden: false,
-            tray_ready: false,
+            tray_ready: true,
             quick_target: None,
             search,
             url,
@@ -182,11 +160,39 @@ impl Shell {
             notice_epoch: 0,
             last_sync: None,
             new_count: 0,
-            _subscriptions: vec![sub, keys, appearance],
+            _subscriptions: vec![sub, keys, activation],
             search_task: None,
         };
         shell.query(cx);
         shell
+    }
+    pub fn recording_status(&self) -> &'static str {
+        if self.settings.privacy {
+            "已暂停"
+        } else if self.settings.history_enabled {
+            "记录中"
+        } else {
+            "记录已关闭"
+        }
+    }
+    pub fn sync_status(&self) -> &str {
+        &self.status
+    }
+
+    /// Change the embedded page without opening another window.
+    pub fn navigate(&mut self, active: bool, settings: bool, cx: &mut Context<Self>) {
+        self.active = active;
+        self.page = settings;
+        self.quick_target = None;
+        if active && !settings {
+            self.hidden = false;
+            self.revision += 1;
+            self.query(cx);
+        } else {
+            self.backend.send(Command::SuspendHistory);
+            self.rows.clear();
+        }
+        cx.notify();
     }
     fn query(&self, cx: &App) {
         self.backend.send(Command::Query {
@@ -225,6 +231,7 @@ impl Shell {
         }
         self.copy_inflight = false;
         self.hidden = false;
+        self.active = true;
         self.page = false;
         self.detail = None;
         self.clear = false;
@@ -401,7 +408,7 @@ impl Shell {
         }
     }
     fn key(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.page {
+        if !self.active || self.page {
             return;
         }
         let k = e.keystroke.key.as_str();
@@ -473,17 +480,21 @@ impl Shell {
         let preview = r.preview.lines().take(3).collect::<Vec<_>>().join("\n");
         let body = div()
             .id(("row", id as u64))
-            .h(px(156.))
+            .h(px(106.))
             .w_full()
             .py_3()
-            .px_3()
             .border_b_1()
             .border_color(colors.border)
-            .when(ix == self.selected, |d| d.bg(colors.hover))
+            .when(ix == self.selected && self.quick_target.is_some(), |d| {
+                d.bg(colors.hover)
+            })
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, w, cx| {
+                cx.listener(move |this, event: &MouseDownEvent, w, cx| {
                     this.selected = ix;
+                    if event.click_count == 2 {
+                        this.backend.send(Command::Detail(id));
+                    }
                     w.focus(&this.focus, cx);
                     cx.notify();
                 }),
@@ -498,21 +509,29 @@ impl Shell {
                         div()
                             .text_size(px(12.))
                             .text_color(colors.fg_muted)
-                            .child(format!(
-                                "{}  ·  {}{}",
-                                format_time(r.created),
-                                if r.source == "remote" {
-                                    "远程"
-                                } else {
-                                    "本地"
-                                },
-                                if r.pinned { "  ·  已收藏" } else { "" }
-                            )),
+                            .child(format_time(r.created)),
                     )
                     .child(
                         div()
                             .flex()
                             .gap_1()
+                            .child(
+                                IconButton::new(("pin", id as u64), IconName::Star)
+                                    .size(ControlSize::Sm)
+                                    .variant(if pinned {
+                                        ButtonVariant::Secondary
+                                    } else {
+                                        ButtonVariant::Ghost
+                                    })
+                                    .tooltip(if pinned {
+                                        "取消收藏（已收藏）"
+                                    } else {
+                                        "收藏置顶"
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, _| {
+                                        this.backend.send(Command::Pin(id, !pinned));
+                                    })),
+                            )
                             .child(
                                 IconButton::new(("copy", id as u64), IconName::Copy)
                                     .tooltip("复制")
@@ -521,17 +540,6 @@ impl Shell {
                                             i: id,
                                             target: None,
                                         });
-                                    })),
-                            )
-                            .child(
-                                IconButton::new(("pin", id as u64), IconName::Pin)
-                                    .tooltip(if pinned {
-                                        "取消收藏"
-                                    } else {
-                                        "收藏置顶"
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, _| {
-                                        this.backend.send(Command::Pin(id, !pinned));
                                     })),
                             )
                             .child(
@@ -545,24 +553,11 @@ impl Shell {
             )
             .child(
                 div()
-                    .h(px(65.))
+                    .h(px(45.))
                     .overflow_hidden()
                     .text_size(px(15.))
                     .line_height(px(22.))
                     .child(preview),
-            )
-            .child(
-                div().flex().child(
-                    Button::new(
-                        ("detail", id as u64),
-                        format!("查看全文 · {} 字符", r.chars),
-                    )
-                    .variant(ButtonVariant::Link)
-                    .size(ControlSize::Sm)
-                    .on_click(
-                        cx.listener(move |this, _, _, _| this.backend.send(Command::Detail(id))),
-                    ),
-                ),
             )
             .into_any_element();
         let b1 = self.backend.clone();
@@ -608,7 +603,7 @@ impl Shell {
                         .on_click(move |_, _| b5.send(Command::Delete(id))),
                 ),
         )
-        .h(px(156.))
+        .h(px(106.))
         .child(body)
         .into_any_element()
     }
@@ -619,42 +614,6 @@ impl Shell {
             .flex_col()
             .size_full()
             .min_h_0()
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_start()
-                    .mb_6()
-                    .child(
-                        div()
-                            .child(
-                                div()
-                                    .text_size(px(28.))
-                                    .font_weight(FontWeight::BOLD)
-                                    .child("历史记录"),
-                            )
-                            .child(
-                                div()
-                                    .mt_2()
-                                    .text_size(px(13.))
-                                    .text_color(colors.fg_muted)
-                                    .child(if self.search.read(cx).is_empty() && !self.pinned {
-                                        format!("{} 条记录", self.total)
-                                    } else {
-                                        format!("找到 {} 条 / 共 {} 条", self.matched, self.total)
-                                    }),
-                            ),
-                    )
-                    .child(
-                        Button::new("clear-history", "清空历史")
-                            .variant(ButtonVariant::Link)
-                            .disabled(self.total == 0)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.clear = true;
-                                cx.notify();
-                            })),
-                    ),
-            )
             .child(
                 div()
                     .flex()
@@ -683,6 +642,30 @@ impl Shell {
                                     });
                                 }
                             }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .pb_3()
+                    .text_size(px(13.))
+                    .text_color(colors.fg_muted)
+                    .child(if self.search.read(cx).is_empty() && !self.pinned {
+                        format!("{} 条记录", self.total)
+                    } else {
+                        format!("找到 {} 条 / 共 {} 条", self.matched, self.total)
+                    })
+                    .child(
+                        Button::new("clear-history", "清空历史")
+                            .variant(ButtonVariant::Ghost)
+                            .size(ControlSize::Sm)
+                            .disabled(self.total == 0)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.clear = true;
+                                cx.notify();
+                            })),
                     ),
             )
             .when(self.quick_target.is_some(), |d| {
@@ -718,7 +701,7 @@ impl Shell {
                                 {
                                     "没有匹配的记录"
                                 } else {
-                                    "复制一段文字，SwiftClip 会记录在这里"
+                                    "复制一段文字，Ducky 会记录在这里"
                                 },
                             ),
                         )
@@ -825,19 +808,6 @@ impl Shell {
             .child(
                 div()
                     .pb_8()
-                    .child(
-                        div()
-                            .text_size(px(28.))
-                            .font_weight(FontWeight::BOLD)
-                            .child("设置"),
-                    )
-                    .child(
-                        div()
-                            .mt_2()
-                            .text_color(c.fg_muted)
-                            .text_size(px(13.))
-                            .child("本地记录，安静同步。"),
-                    )
                     .child(heading("连接"))
                     .child(div().mb_3().text_size(px(13.)).child("服务器地址"))
                     .child(Input::new(&self.url))
@@ -999,20 +969,6 @@ impl Shell {
                         |s, v| s.hotkey = v.into(),
                         cx,
                     ))
-                    .child(self.setting_switch(
-                        "startup",
-                        "开机启动到托盘",
-                        self.settings.startup,
-                        |s, v| s.startup = v,
-                        cx,
-                    ))
-                    .child(self.setting_switch(
-                        "minimize",
-                        "关闭窗口时收起到托盘",
-                        self.settings.minimize_to_tray,
-                        |s, v| s.minimize_to_tray = v,
-                        cx,
-                    ))
                     .child(heading("隐私"))
                     .child(self.setting_switch(
                         "privacy",
@@ -1026,7 +982,7 @@ impl Shell {
                     ))
                     .child(heading("关于"))
                     .child(div().text_size(px(13.)).child(concat!(
-                        "SwiftClip ",
+                        "Ducky · 剪贴板 ",
                         env!("CARGO_PKG_VERSION"),
                         " · Rust / GPUI / Ely"
                     )))
@@ -1117,111 +1073,6 @@ impl Render for Shell {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
         let detail = self.detail_view(cx);
-        let side = div()
-            .flex_none()
-            .w(px(224.))
-            .h_full()
-            .bg(colors.sunken)
-            .border_r_1()
-            .border_color(colors.border)
-            .p_5()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .pt_4()
-                    .pb_10()
-                    .child(
-                        div()
-                            .size(px(38.))
-                            .rounded(px(12.))
-                            .bg(colors.accent)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(Icon::new(IconName::Clipboard).color(colors.on_accent)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(24.))
-                            .font_weight(FontWeight::BOLD)
-                            .child("SwiftClip"),
-                    ),
-            )
-            .child(
-                NavItem::new("nav-history", IconName::History, "历史记录")
-                    .active(!self.page)
-                    .on_click({
-                        let weak = cx.entity().downgrade();
-                        move |w, cx| {
-                            let _ = weak.update(cx, |this, cx| {
-                                this.page = false;
-                                this.revision += 1;
-                                this.query(cx);
-                                w.focus(&this.focus, cx);
-                                cx.notify();
-                            });
-                        }
-                    }),
-            )
-            .child(
-                NavItem::new("nav-settings", IconName::Settings, "设置")
-                    .active(self.page)
-                    .on_click({
-                        let weak = cx.entity().downgrade();
-                        move |_, cx| {
-                            let _ = weak.update(cx, |this, cx| {
-                                this.backend.send(Command::SuspendHistory);
-                                this.page = true;
-                                this.quick_target = None;
-                                this.rows.clear();
-                                cx.notify();
-                            });
-                        }
-                    }),
-            )
-            .child(div().flex_1())
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(colors.fg_muted)
-                    .mb_2()
-                    .child(if self.settings.privacy {
-                        "Ⅱ 隐私暂停"
-                    } else if self.settings.history_enabled {
-                        "● 正在记录"
-                    } else {
-                        "○ 历史未启用"
-                    }),
-            )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(if self.error.is_some() {
-                        colors.danger
-                    } else {
-                        colors.fg_muted
-                    })
-                    .mb_2()
-                    .child(self.status.clone()),
-            )
-            .when_some(self.last_sync, |d, at| {
-                d.child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(colors.fg_muted)
-                        .mb_3()
-                        .child(format!("最近同步 {}", format_time(at))),
-                )
-            })
-            .child(
-                Button::new("hide-window", "收起到托盘")
-                    .variant(ButtonVariant::Ghost)
-                    .on_click(cx.listener(|this, _, w, cx| this.hide(w, cx))),
-            );
         let content = if self.page {
             self.settings_page(cx)
         } else {
@@ -1236,13 +1087,11 @@ impl Render for Shell {
             .text_size(px(15.))
             .bg(colors.bg)
             .text_color(colors.fg)
-            .child(side)
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
-                    .p_8()
                     .flex()
                     .flex_col()
                     .when_some(self.error.clone(), |d, error| {

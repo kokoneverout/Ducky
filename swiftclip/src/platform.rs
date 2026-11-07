@@ -16,7 +16,6 @@ use std::{
 use tokio::sync::oneshot;
 use windows_sys::Win32::{
     Foundation::*,
-    Graphics::Dwm::*,
     Security::Credentials::*,
     System::{DataExchange::*, LibraryLoader::*, Memory::*, Registry::*, Threading::*},
     UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
@@ -38,30 +37,6 @@ pub fn display_path(path: &std::path::Path) -> String {
             _ => text.into_owned(),
         },
         _ => text.into_owned(),
-    }
-}
-pub fn style_titlebar(handle: isize, background: u32, foreground: u32) {
-    // Win32 COLORREF is BGR; the page palette uses RGB.
-    let colorref = |rgb: u32| ((rgb & 0xff) << 16) | (rgb & 0xff00) | ((rgb >> 16) & 0xff);
-    for (attribute, value) in [
-        (DWMWA_USE_IMMERSIVE_DARK_MODE, 0u32),
-        (DWMWA_CAPTION_COLOR, colorref(background)),
-        (DWMWA_TEXT_COLOR, colorref(foreground)),
-    ] {
-        let result = unsafe {
-            DwmSetWindowAttribute(
-                handle as HWND,
-                attribute as u32,
-                &value as *const u32 as _,
-                size_of::<u32>() as u32,
-            )
-        };
-        if result < 0 {
-            crate::diagnostics::record(
-                "titlebar_style_failed",
-                serde_json::json!({"attribute":attribute,"hresult":format!("0x{:08X}",result as u32)}),
-            );
-        }
     }
 }
 const WAKE: u32 = WM_APP + 73;
@@ -875,17 +850,6 @@ pub fn startup(enabled: bool, _data_dir: &std::path::Path) -> Result<()> {
         Ok(())
     }
 }
-pub fn error_dialog(message: &str) {
-    unsafe {
-        MessageBoxW(
-            null_mut(),
-            wide(message).as_ptr(),
-            wide("Ducky").as_ptr(),
-            MB_OK | MB_ICONERROR,
-        );
-    }
-}
-
 #[cfg(test)]
 impl Native {
     pub fn test_stub() -> Self {

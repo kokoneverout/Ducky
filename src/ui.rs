@@ -31,6 +31,8 @@ enum Page {
     History,
     Api,
     Animation,
+    ClipboardHistory,
+    ClipboardSettings,
 }
 
 pub struct VoiceApp {
@@ -59,6 +61,7 @@ pub struct VoiceApp {
     animation: AnimationConfig,
     startup_enabled: bool,
     isolated: bool,
+    clipboard: Option<Entity<swiftclip::ui::Shell>>,
 }
 
 fn field(
@@ -92,6 +95,7 @@ impl VoiceApp {
         history: History,
         startup: Option<String>,
         isolated: bool,
+        clipboard: Option<(swiftclip::model::Backend, swiftclip::model::Settings)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -103,7 +107,11 @@ impl VoiceApp {
         };
         let startup_error = enabled.as_ref().err().map(|error| format!("{error:#}"));
         let startup = startup.or(startup_error);
+        let clipboard = clipboard.map(|(backend, settings)| {
+            cx.new(|cx| swiftclip::ui::Shell::new(backend, settings, window, cx))
+        });
         let mut result = Self {
+            clipboard,
             focus: cx.focus_handle(),
             page: Page::History,
             status: startup.clone().unwrap_or_default(),
@@ -144,6 +152,9 @@ impl VoiceApp {
             shared,
             events,
         };
+        if let Some(clipboard) = &result.clipboard {
+            cx.observe(clipboard, |_, _, cx| cx.notify()).detach();
+        }
         for input in result.api_inputs() {
             cx.observe(&input, |_, _, cx| cx.notify()).detach();
         }
@@ -199,6 +210,24 @@ impl VoiceApp {
                 }
             }
             Event::Preview(_) | Event::Quit => {}
+        }
+        cx.notify();
+    }
+
+    pub fn clipboard_event(
+        &mut self,
+        event: swiftclip::model::UiEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use swiftclip::model::UiEvent;
+        match &event {
+            UiEvent::Summon(_) => self.page = Page::ClipboardHistory,
+            UiEvent::OpenSettings => self.page = Page::ClipboardSettings,
+            _ => {}
+        }
+        if let Some(clipboard) = &self.clipboard {
+            clipboard.update(cx, |shell, cx| shell.receive(event, window, cx));
         }
         cx.notify();
     }
@@ -268,7 +297,7 @@ impl VoiceApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
-            .id(label)
+            .id(("nav", page as usize))
             .role(Role::Button)
             .aria_label(label)
             .flex()
@@ -284,6 +313,15 @@ impl VoiceApp {
             .child(label)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.page = page;
+                if let Some(clipboard) = &this.clipboard {
+                    clipboard.update(cx, |shell, cx| {
+                        shell.navigate(
+                            matches!(page, Page::ClipboardHistory | Page::ClipboardSettings),
+                            page == Page::ClipboardSettings,
+                            cx,
+                        )
+                    });
+                }
                 this.confirm_clear = false;
                 this.error = false;
                 this.status.clear();
@@ -598,12 +636,25 @@ impl Render for VoiceApp {
             Page::History => "历史记录",
             Page::Api => "API 配置",
             Page::Animation => "动画设置",
+            Page::ClipboardHistory => "历史记录",
+            Page::ClipboardSettings => "设置",
         };
         let page = match self.page {
             Page::History => self.history_page(cx),
             Page::Api => self.api_page(window, cx),
             Page::Animation => self.animation_page(cx),
+            Page::ClipboardHistory | Page::ClipboardSettings => self
+                .clipboard
+                .as_ref()
+                .map(|clipboard| clipboard.clone().into_any_element())
+                .unwrap_or_else(|| {
+                    div()
+                        .text_color(rgb(MUTED))
+                        .child("剪贴板模块未启动")
+                        .into_any_element()
+                }),
         };
+        let clipboard_page = matches!(self.page, Page::ClipboardHistory | Page::ClipboardSettings);
         let configured = self
             .shared
             .read()
@@ -642,9 +693,7 @@ impl Render for VoiceApp {
                                     .gap_2()
                                     .px_2()
                                     .child(img("app-icon.png").w_9().h_9())
-                                    .child(
-                                        div().font_weight(FontWeight::SEMIBOLD).child("ASRInput"),
-                                    ),
+                                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Ducky")),
                             )
                             .child(
                                 div()
@@ -652,6 +701,17 @@ impl Render for VoiceApp {
                                     .flex()
                                     .flex_col()
                                     .gap_1()
+                                    .child(
+                                        div()
+                                            .px_3()
+                                            .pb_2()
+                                            .flex()
+                                            .justify_between()
+                                            .text_xs()
+                                            .text_color(rgb(MUTED))
+                                            .child("语音输入")
+                                            .child("右 Ctrl"),
+                                    )
                                     .child(self.nav(
                                         Page::History,
                                         "历史记录",
@@ -669,7 +729,53 @@ impl Render for VoiceApp {
                                         "动画设置",
                                         IconName::AudioLines,
                                         cx,
-                                    )),
+                                    ))
+                                    .child(
+                                        div()
+                                            .mt_4()
+                                            .pt_4()
+                                            .px_3()
+                                            .border_t_1()
+                                            .border_color(rgb(LINE))
+                                            .flex()
+                                            .justify_between()
+                                            .text_xs()
+                                            .text_color(rgb(MUTED))
+                                            .child("剪贴板")
+                                            .child(
+                                                self.clipboard
+                                                    .as_ref()
+                                                    .map(|shell| {
+                                                        format!(
+                                                            "● {}",
+                                                            shell.read(cx).recording_status()
+                                                        )
+                                                    })
+                                                    .unwrap_or_else(|| "未启动".into()),
+                                            ),
+                                    )
+                                    .child(self.nav(
+                                        Page::ClipboardHistory,
+                                        "历史记录",
+                                        IconName::Clipboard,
+                                        cx,
+                                    ))
+                                    .child(self.nav(
+                                        Page::ClipboardSettings,
+                                        "设置",
+                                        IconName::Settings,
+                                        cx,
+                                    ))
+                                    .child(
+                                        div().pl_10().text_xs().text_color(rgb(MUTED)).child(
+                                            self.clipboard
+                                                .as_ref()
+                                                .map(|shell| {
+                                                    shell.read(cx).sync_status().to_owned()
+                                                })
+                                                .unwrap_or_default(),
+                                        ),
+                                    ),
                             )
                             .child(div().flex_1())
                             .child({
@@ -739,15 +845,25 @@ impl Render for VoiceApp {
                             .flex_col()
                             .child(
                                 div()
-                                    .h(px(52.0))
                                     .px_7()
+                                    .pt_5()
+                                    .pb_3()
                                     .flex_shrink_0()
                                     .flex()
-                                    .items_center()
+                                    .flex_col()
+                                    .when(clipboard_page, |el| {
+                                        el.child(
+                                            div().text_xs().text_color(rgb(MUTED)).child("剪贴板"),
+                                        )
+                                    })
                                     .child(
                                         div()
-                                            .text_base()
-                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_size(if clipboard_page {
+                                                px(20.0)
+                                            } else {
+                                                px(16.0)
+                                            })
+                                            .font_weight(FontWeight::SEMIBOLD)
                                             .child(title),
                                     ),
                             )
@@ -756,7 +872,7 @@ impl Render for VoiceApp {
                                     .id("page-scroll")
                                     .flex_1()
                                     .min_h_0()
-                                    .overflow_y_scroll()
+                                    .when(!clipboard_page, |el| el.overflow_y_scroll())
                                     .px_7()
                                     .pt_3()
                                     .pb_7()
