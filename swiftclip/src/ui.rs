@@ -4,7 +4,7 @@ use ely_core::{
     forms::{
         Checkbox, Choice, Input, InputEvent, PasswordInput, SearchInput, Select, Switch, TextInput,
     },
-    layout::ScrollArea,
+    layout::{ScrollArea, Scrollbar},
     menus::{ContextMenu, Menu as ElyMenu, MenuItem as ElyMenuItem},
     overlays::Dialog,
     primitives::{FocusScope, IconName},
@@ -52,6 +52,7 @@ pub struct Shell {
     clear: bool,
     clear_pinned: bool,
     status: String,
+    health: SyncHealth,
     error: Option<String>,
     notice: Option<String>,
     notice_epoch: u64,
@@ -155,6 +156,7 @@ impl Shell {
             clear: false,
             clear_pinned: false,
             status: "正在启动".into(),
+            health: SyncHealth::Disconnected,
             error: None,
             notice: None,
             notice_epoch: 0,
@@ -166,17 +168,8 @@ impl Shell {
         shell.query(cx);
         shell
     }
-    pub fn recording_status(&self) -> &'static str {
-        if self.settings.privacy {
-            "已暂停"
-        } else if self.settings.history_enabled {
-            "记录中"
-        } else {
-            "记录已关闭"
-        }
-    }
-    pub fn sync_status(&self) -> &str {
-        &self.status
+    pub fn sync_health(&self) -> SyncHealth {
+        self.health
     }
 
     /// Change the embedded page without opening another window.
@@ -249,6 +242,7 @@ impl Shell {
     pub fn receive(&mut self, event: UiEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             UiEvent::Snapshot(s) => {
+                self.health = s.health();
                 self.settings = s.settings;
                 self.status = s.status;
                 self.error = s.error.or(self.error.take());
@@ -477,7 +471,12 @@ impl Shell {
         let id = r.id;
         let pinned = r.pinned;
         let colors = cx.theme().colors.clone();
-        let preview = r.preview.lines().take(3).collect::<Vec<_>>().join("\n");
+        let flattened = r.preview.split_whitespace().collect::<Vec<_>>().join(" ");
+        let preview = if flattened.chars().count() > 120 || r.chars > r.preview.chars().count() {
+            format!("{}…", flattened.chars().take(120).collect::<String>())
+        } else {
+            flattened
+        };
         let body = div()
             .id(("row", id as u64))
             .h(px(106.))
@@ -515,6 +514,14 @@ impl Shell {
                         div()
                             .flex()
                             .gap_1()
+                            .child(
+                                Button::new(("detail", id as u64), "查看全文")
+                                    .variant(ButtonVariant::Ghost)
+                                    .size(ControlSize::Sm)
+                                    .on_click(cx.listener(move |this, _, _, _| {
+                                        this.backend.send(Command::Detail(id))
+                                    })),
+                            )
                             .child(
                                 IconButton::new(("pin", id as u64), IconName::Star)
                                     .size(ControlSize::Sm)
@@ -554,7 +561,7 @@ impl Shell {
             .child(
                 div()
                     .h(px(45.))
-                    .overflow_hidden()
+                    .truncate()
                     .text_size(px(15.))
                     .line_height(px(22.))
                     .child(preview),
@@ -707,17 +714,27 @@ impl Shell {
                         )
                     })
                     .when(!self.rows.is_empty(), |d| {
-                        d.child(
-                            uniform_list(
-                                "history-list",
-                                self.rows.len(),
-                                cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
-                                    range.map(|ix| this.row(ix, cx)).collect::<Vec<_>>()
-                                }),
+                        let handle = self.scroll.0.borrow().base_handle.clone();
+                        d.relative()
+                            .child(
+                                uniform_list(
+                                    "history-list",
+                                    self.rows.len(),
+                                    cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                                        range.map(|ix| this.row(ix, cx)).collect::<Vec<_>>()
+                                    }),
+                                )
+                                .track_scroll(&self.scroll)
+                                .size_full(),
                             )
-                            .track_scroll(&self.scroll)
-                            .size_full(),
-                        )
+                            .child(
+                                Scrollbar::new(
+                                    "clipboard-history-scrollbar",
+                                    &handle,
+                                    Axis::Vertical,
+                                )
+                                .auto(),
+                            )
                     }),
             )
             .when(self.rows.len() < self.matched, |d| {

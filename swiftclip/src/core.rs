@@ -123,6 +123,7 @@ impl Engine {
         self.needs_read = true;
         self.retry = 0;
         self.error = None;
+        self.status = "连接中".into();
         self.due = Instant::now();
     }
     async fn save(&mut self, text: &str, source: &str, pin: bool) -> Result<()> {

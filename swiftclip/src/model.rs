@@ -96,12 +96,33 @@ pub struct Record {
     pub row: Row,
     pub content: String,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncHealth {
+    Disconnected,
+    Healthy,
+    Unhealthy,
+}
+
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub settings: Settings,
     pub status: String,
     pub error: Option<String>,
     pub last_sync: Option<i64>,
+}
+
+impl Snapshot {
+    pub fn health(&self) -> SyncHealth {
+        if !self.settings.syncing() {
+            SyncHealth::Disconnected
+        } else if self.error.is_some() {
+            SyncHealth::Unhealthy
+        } else if self.status == "已连接" {
+            SyncHealth::Healthy
+        } else {
+            SyncHealth::Disconnected
+        }
+    }
 }
 #[derive(Clone, Copy, Debug)]
 pub struct PasteTarget {

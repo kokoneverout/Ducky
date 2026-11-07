@@ -13,8 +13,11 @@ use api_page::ApiState;
 use ely_core::{
     buttons::{Button, ButtonVariant, IconButton},
     forms::{Choice, Input, Select, Switch, TextInput},
-    primitives::{FocusScope, Icon, IconName},
+    layout::{ScrollArea, Scrollbar},
+    overlays::Dialog,
+    primitives::{FocusScope, Icon, IconName, Tooltip},
     theme::{ControlSize, IconSize},
+    typography::SelectableText,
 };
 use gpui::{prelude::*, *};
 use std::sync::{Arc, RwLock};
@@ -45,6 +48,7 @@ pub struct VoiceApp {
     error: bool,
     working: bool,
     expanded: Option<u64>,
+    history_scroll: UniformListScrollHandle,
     confirm_clear: bool,
     unsaved_result: Option<String>,
     mimo_key: Entity<TextInput>,
@@ -119,6 +123,7 @@ impl VoiceApp {
             working: false,
             history,
             expanded: None,
+            history_scroll: UniformListScrollHandle::new(),
             confirm_clear: false,
             unsaved_result: None,
             mimo_key: field(window, cx, "MiMo API Key", &config.mimo_key, true, false),
@@ -195,11 +200,7 @@ impl VoiceApp {
             } => {
                 self.working = false;
                 self.error = false;
-                self.status = if status.starts_with("已发送粘贴") {
-                    String::new()
-                } else {
-                    status
-                };
+                self.status = status;
                 match self.history.append(raw, text.clone(), model) {
                     Ok(()) => self.unsaved_result = None,
                     Err(error) => {
@@ -296,6 +297,15 @@ impl VoiceApp {
         icon: IconName,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let (health_color, health_label) = match self
+            .clipboard
+            .as_ref()
+            .map(|shell| shell.read(cx).sync_health())
+        {
+            Some(swiftclip::model::SyncHealth::Healthy) => (0x758f6a, "同步服务健康"),
+            Some(swiftclip::model::SyncHealth::Unhealthy) => (0xb45c50, "同步服务异常"),
+            _ => (0xa9afa1, "未连接或隐私暂停"),
+        };
         div()
             .id(("nav", page as usize))
             .role(Role::Button)
@@ -311,6 +321,17 @@ impl VoiceApp {
             .hover(|s| s.bg(rgb(SELECTED)))
             .child(Icon::new(icon).size(IconSize::Sm).color(rgb(INK)))
             .child(label)
+            .when(page == Page::ClipboardSettings, |el| {
+                el.child(div().flex_1()).child(
+                    div()
+                        .id("sync-health")
+                        .size(px(8.0))
+                        .rounded_full()
+                        .bg(rgb(health_color))
+                        .aria_label(health_label)
+                        .tooltip(Tooltip::text(health_label)),
+                )
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.page = page;
                 if let Some(clipboard) = &this.clipboard {
@@ -331,11 +352,11 @@ impl VoiceApp {
 
     fn history_row(&self, entry: &Entry, cx: &mut Context<Self>) -> AnyElement {
         let id = entry.id;
-        let expanded = self.expanded == Some(id);
-        let text = if expanded || entry.text.chars().count() <= 220 {
-            entry.text.clone()
+        let flattened = entry.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let text = if flattened.chars().count() > 120 {
+            format!("{}…", flattened.chars().take(120).collect::<String>())
         } else {
-            format!("{}…", entry.text.chars().take(220).collect::<String>())
+            flattened
         };
         let date = chrono::DateTime::from_timestamp(entry.timestamp, 0)
             .map(|t| {
@@ -348,7 +369,10 @@ impl VoiceApp {
         div()
             .id(("entry", id))
             .group("entry")
-            .py_5()
+            .h(px(106.0))
+            .w_full()
+            .min_w_0()
+            .py_3()
             .border_b_1()
             .border_color(rgb(LINE))
             .flex()
@@ -356,6 +380,7 @@ impl VoiceApp {
             .gap_3()
             .child(
                 div()
+                    .w_full()
                     .flex()
                     .items_center()
                     .justify_between()
@@ -373,6 +398,15 @@ impl VoiceApp {
                         div()
                             .flex()
                             .gap_1()
+                            .child(
+                                Button::new(("detail", id), "查看全文")
+                                    .variant(ButtonVariant::Ghost)
+                                    .size(ControlSize::Sm)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.expanded = Some(id);
+                                        cx.notify();
+                                    })),
+                            )
                             .child(
                                 IconButton::new(("copy", id), IconName::Copy)
                                     .size(ControlSize::Sm)
@@ -396,27 +430,14 @@ impl VoiceApp {
             .child(
                 div()
                     .id(("text", id))
+                    .w_full()
+                    .min_w_0()
+                    .h(px(45.0))
+                    .truncate()
                     .text_size(px(14.0))
                     .line_height(px(25.0))
-                    .cursor_pointer()
-                    .child(text)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.expanded = if expanded { None } else { Some(id) };
-                        cx.notify();
-                    })),
+                    .child(text),
             )
-            .when(expanded && entry.raw != entry.text, |el| {
-                el.child(
-                    div()
-                        .pl_3()
-                        .border_l_2()
-                        .border_color(rgb(LINE))
-                        .text_sm()
-                        .line_height(px(23.0))
-                        .text_color(rgb(MUTED))
-                        .child(entry.raw.clone()),
-                )
-            })
             .into_any_element()
     }
 
@@ -425,6 +446,7 @@ impl VoiceApp {
             .flex()
             .flex_col()
             .size_full()
+            .min_h_0()
             .child(
                 div()
                     .flex()
@@ -476,13 +498,92 @@ impl VoiceApp {
                         .child("暂无记录"),
                 )
             })
-            .children(
-                self.history
-                    .entries
-                    .iter()
-                    .map(|entry| self.history_row(entry, cx)),
-            )
+            .when(!self.history.entries.is_empty(), |el| {
+                let handle = self.history_scroll.0.borrow().base_handle.clone();
+                el.child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .child(
+                            uniform_list(
+                                "voice-history-list",
+                                self.history.entries.len(),
+                                cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                                    range
+                                        .filter_map(|ix| {
+                                            this.history
+                                                .entries
+                                                .get(ix)
+                                                .map(|entry| this.history_row(entry, cx))
+                                        })
+                                        .collect::<Vec<_>>()
+                                }),
+                            )
+                            .track_scroll(&self.history_scroll)
+                            .size_full(),
+                        )
+                        .child(
+                            Scrollbar::new("voice-history-scrollbar", &handle, Axis::Vertical)
+                                .auto(),
+                        ),
+                )
+            })
             .into_any_element()
+    }
+
+    fn history_detail(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let entry = self
+            .history
+            .entries
+            .iter()
+            .find(|entry| Some(entry.id) == self.expanded)?;
+        let weak = cx.entity().downgrade();
+        let text = entry.text.clone();
+        let copied = text.clone();
+        let raw = entry.raw.clone();
+        let polished = raw != text;
+        Some(
+            Dialog::new("voice-detail", "完整文本", move |_, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    this.expanded = None;
+                    cx.notify();
+                });
+            })
+            .child(
+                ScrollArea::new("voice-detail-scroll").h(px(360.0)).child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .when(polished, |el| {
+                            el.child(div().text_sm().text_color(rgb(MUTED)).child("润色结果"))
+                        })
+                        .child(SelectableText::new("voice-detail-text", text))
+                        .when(polished, |el| {
+                            el.child(
+                                div()
+                                    .pt_3()
+                                    .text_sm()
+                                    .text_color(rgb(MUTED))
+                                    .child("识别原文"),
+                            )
+                            .child(SelectableText::new("voice-detail-raw", raw))
+                        }),
+                ),
+            )
+            .child(
+                div().flex().justify_end().mt_3().child(
+                    Button::new("copy-voice-detail", "复制全文")
+                        .variant(ButtonVariant::Primary)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let result = platform::copy(&copied);
+                            this.report(result, "已复制", cx);
+                        })),
+                ),
+            )
+            .into_any_element(),
+        )
     }
 
     fn labeled(label: &'static str, input: impl IntoElement) -> Div {
@@ -655,12 +756,6 @@ impl Render for VoiceApp {
                 }),
         };
         let clipboard_page = matches!(self.page, Page::ClipboardHistory | Page::ClipboardSettings);
-        let configured = self
-            .shared
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .validate()
-            .is_ok();
         FocusScope::new(&self.focus)
             .root()
             .relative()
@@ -670,6 +765,7 @@ impl Render for VoiceApp {
             .text_color(rgb(INK))
             .bg(rgb(PAPER))
             .when_some(self.prompt_dialog(cx), |el, dialog| el.child(dialog))
+            .when_some(self.history_detail(cx), |el, dialog| el.child(dialog))
             .child(
                 div()
                     .size_full()
@@ -742,17 +838,7 @@ impl Render for VoiceApp {
                                             .text_xs()
                                             .text_color(rgb(MUTED))
                                             .child("剪贴板")
-                                            .child(
-                                                self.clipboard
-                                                    .as_ref()
-                                                    .map(|shell| {
-                                                        format!(
-                                                            "● {}",
-                                                            shell.read(cx).recording_status()
-                                                        )
-                                                    })
-                                                    .unwrap_or_else(|| "未启动".into()),
-                                            ),
+                                            .child("右 Alt"),
                                     )
                                     .child(self.nav(
                                         Page::ClipboardHistory,
@@ -765,17 +851,7 @@ impl Render for VoiceApp {
                                         "设置",
                                         IconName::Settings,
                                         cx,
-                                    ))
-                                    .child(
-                                        div().pl_10().text_xs().text_color(rgb(MUTED)).child(
-                                            self.clipboard
-                                                .as_ref()
-                                                .map(|shell| {
-                                                    shell.read(cx).sync_status().to_owned()
-                                                })
-                                                .unwrap_or_default(),
-                                        ),
-                                    ),
+                                    )),
                             )
                             .child(div().flex_1())
                             .child({
@@ -805,31 +881,6 @@ impl Render for VoiceApp {
                                             }),
                                     )
                             })
-                            .child(
-                                div()
-                                    .p_3()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .child(div().size(px(6.0)).rounded_full().bg(rgb(
-                                        if self.error {
-                                            0xb46d50
-                                        } else if self.working {
-                                            0x7c9774
-                                        } else {
-                                            0xabb29d
-                                        },
-                                    )))
-                                    .child(if self.working {
-                                        self.status.clone()
-                                    } else if configured {
-                                        "右 Ctrl".into()
-                                    } else {
-                                        "待配置".into()
-                                    }),
-                            )
                             .child(
                                 Button::new("hide-to-tray", "收起到托盘")
                                     .variant(ButtonVariant::Ghost)
@@ -872,7 +923,9 @@ impl Render for VoiceApp {
                                     .id("page-scroll")
                                     .flex_1()
                                     .min_h_0()
-                                    .when(!clipboard_page, |el| el.overflow_y_scroll())
+                                    .when(!clipboard_page && self.page != Page::History, |el| {
+                                        el.overflow_y_scroll()
+                                    })
                                     .px_7()
                                     .pt_3()
                                     .pb_7()

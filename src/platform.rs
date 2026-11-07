@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{
+    io::Write,
     path::Path,
     ptr::{null, null_mut},
     sync::{
@@ -158,63 +159,105 @@ pub fn copy(text: &str) -> Result<()> {
         .context("无法写入剪贴板")
 }
 
-pub fn insert(text: &str, original: Target) -> Result<&'static str> {
-    copy(text)?;
-    if target() != original {
-        return Ok("焦点已改变，结果已复制，请在目标输入框手动粘贴");
-    }
-    // Never paste into our own settings or combine with a user's held modifier.
-    // SAFETY: these APIs take scalar key codes, with no borrowed pointers.
+const RIME_TEXT_PATH: &str = r"D:\Documents\weasel\cut\text.txt";
+
+fn modifiers_held() -> bool {
+    // SAFETY: GetAsyncKeyState only reads the state of these virtual keys.
     unsafe {
-        if original.window == 0
-            || original.process == std::process::id()
-            || [
-                VK_LCONTROL,
-                VK_RCONTROL,
-                VK_LSHIFT,
-                VK_RSHIFT,
-                VK_LMENU,
-                VK_RMENU,
-                VK_LWIN,
-                VK_RWIN,
-            ]
-            .iter()
-            .any(|key| GetAsyncKeyState(*key as i32) < 0)
-        {
-            return Ok("结果已复制，请在目标输入框粘贴");
-        }
-        let key = |vk, flags| INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: vk,
-                    dwFlags: flags,
-                    ..Default::default()
-                },
+        [
+            VK_LCONTROL,
+            VK_RCONTROL,
+            VK_LSHIFT,
+            VK_RSHIFT,
+            VK_LMENU,
+            VK_RMENU,
+            VK_LWIN,
+            VK_RWIN,
+        ]
+        .iter()
+        .any(|key| GetAsyncKeyState(*key as i32) < 0)
+    }
+}
+
+fn write_rime_text(path: &Path, text: &str) -> Result<()> {
+    // Never overwrite an unconsumed result or a file belonging to another producer.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "无法创建 Rime 上屏文件 {}（如果文件已存在，请先处理）",
+                path.display()
+            )
+        })?;
+    if let Err(error) = file.write_all(text.as_bytes()).and_then(|_| file.flush()) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(error).context("写入 Rime 上屏文件失败");
+    }
+    Ok(())
+}
+
+pub fn insert(text: &str, original: Target) -> Result<&'static str> {
+    if original.window == 0 || original.process == std::process::id() || target() != original {
+        return Ok("焦点已改变或目标无效，未上屏；结果保存在语音历史中");
+    }
+    if modifiers_held() {
+        return Ok("有修饰键仍被按住，未上屏；结果保存在语音历史中");
+    }
+    let path = Path::new(RIME_TEXT_PATH);
+    write_rime_text(path, text)?;
+    // Never activate or restore any window. Check again immediately before injecting.
+    if target() != original || modifiers_held() {
+        let _ = std::fs::remove_file(path);
+        return Ok("焦点或按键状态已改变，未上屏；结果保存在语音历史中");
+    }
+    let key = |vk, flags| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                dwFlags: flags,
+                ..Default::default()
             },
-        };
-        let events = [
-            key(VK_LCONTROL, 0),
-            key(VK_V, 0),
-            key(VK_V, KEYEVENTF_KEYUP),
-            key(VK_LCONTROL, KEYEVENTF_KEYUP),
-        ];
-        let sent = SendInput(
+        },
+    };
+    let events = [
+        key(VK_LCONTROL, 0),
+        key(VK_LSHIFT, 0),
+        key(VK_F12, 0),
+        key(VK_F12, KEYEVENTF_KEYUP),
+        key(VK_LSHIFT, KEYEVENTF_KEYUP),
+        key(VK_LCONTROL, KEYEVENTF_KEYUP),
+    ];
+    // SAFETY: INPUT entries are initialized and no window activation is requested.
+    let sent = unsafe {
+        SendInput(
             events.len() as u32,
             events.as_ptr(),
             size_of::<INPUT>() as i32,
-        );
-        if sent != events.len() as u32 {
-            // Best effort cleanup in case only a key-down was injected.
-            let cleanup = [
-                key(VK_V, KEYEVENTF_KEYUP),
-                key(VK_LCONTROL, KEYEVENTF_KEYUP),
-            ];
-            SendInput(2, cleanup.as_ptr(), size_of::<INPUT>() as i32);
-            return Ok("系统未接受粘贴按键，结果已复制，请手动粘贴");
+        )
+    };
+    if sent != events.len() as u32 {
+        let cleanup = [
+            key(VK_F12, KEYEVENTF_KEYUP),
+            key(VK_LSHIFT, KEYEVENTF_KEYUP),
+            key(VK_LCONTROL, KEYEVENTF_KEYUP),
+        ];
+        unsafe {
+            SendInput(
+                cleanup.len() as u32,
+                cleanup.as_ptr(),
+                size_of::<INPUT>() as i32,
+            );
         }
+        if sent < 3 {
+            let _ = std::fs::remove_file(path);
+        }
+        bail!("系统未完整发送 Rime 快捷键；请检查上屏文件和语音历史");
     }
-    Ok("已发送粘贴，结果同时保留在剪贴板")
+    Ok("已发送 Rime 上屏快捷键，请确认输入法已处理")
 }
 
 pub fn protect(text: &str) -> Result<String> {
@@ -314,6 +357,23 @@ pub fn show_error(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rime_file_is_utf8_and_never_overwrites_pending_text() {
+        let path = std::env::temp_dir().join(format!(
+            "ducky-rime-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_rime_text(&path, "中文\nhello").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), "中文\nhello".as_bytes());
+        assert!(write_rime_text(&path, "replacement").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), "中文\nhello".as_bytes());
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn keys_round_trip_through_windows_dpapi() {
