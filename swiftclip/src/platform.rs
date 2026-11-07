@@ -834,7 +834,7 @@ pub fn save_password(s: &Settings, password: &str) -> Result<()> {
         Ok(())
     }
 }
-pub fn startup(enabled: bool, data_dir: &std::path::Path) -> Result<()> {
+pub fn startup(enabled: bool, _data_dir: &std::path::Path) -> Result<()> {
     unsafe {
         let mut h = null_mut();
         let key = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -852,14 +852,10 @@ pub fn startup(enabled: bool, data_dir: &std::path::Path) -> Result<()> {
             ) == ERROR_SUCCESS,
             "无法打开开机自启设置"
         );
-        let name = wide("SwiftClip-Rust");
+        let name = wide("Ducky-Clipboard");
         let result = if enabled {
             let exe = std::env::current_exe()?;
-            let value = wide(&format!(
-                "{} --hidden --data-dir {}",
-                quote_path(&exe),
-                quote_path(data_dir)
-            ));
+            let value = wide(&format!("{} --background", quote_path(&exe)));
             RegSetValueExW(
                 h,
                 name.as_ptr(),
@@ -884,7 +880,7 @@ pub fn error_dialog(message: &str) {
         MessageBoxW(
             null_mut(),
             wide(message).as_ptr(),
-            wide("SwiftClip").as_ptr(),
+            wide("Ducky").as_ptr(),
             MB_OK | MB_ICONERROR,
         );
     }

@@ -5759,7 +5759,6 @@ dependencies = [
  "anyhow",
  "ely-core",
  "ely-desktop",
- "embed-resource",
  "futures",
  "gpui-pre",
  "raw-window-handle",
