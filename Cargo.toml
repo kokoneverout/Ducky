@@ -1,0 +1,41 @@
+[workspace]
+members = ["swiftclip"]
+resolver = "3"
+
+[package]
+name = "ducky"
+version = "0.4.1"
+edition = "2024"
+rust-version = "1.98"
+description = "A small Windows push-to-talk input app powered by MiMo and GPUI"
+license = "MIT"
+
+[dependencies]
+swiftclip = { path = "swiftclip" }
+anyhow = "1"
+arboard = { version = "3.6", default-features = false }
+async-channel = "2"
+base64 = "0.22"
+cpal = "0.16"
+ely-core = { git = "https://github.com/ELY-Open-Source/Ely-GPUI-Components", rev = "dbfdf0ce7ff2d4328f00ea5b00bfa8f3aa504e42", default-features = false }
+gpui = { package = "gpui-pre", version = "=0.3.10", default-features = false }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", default-features = false, features = ["font-kit"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt", "time"] }
+futures-lite = "2"
+image = { version = "0.25", default-features = false, features = ["gif", "png"] }
+raw-window-handle = "0.6"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Security", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_UI_Controls_Dialogs", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+embed-resource = "3"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = true
+
